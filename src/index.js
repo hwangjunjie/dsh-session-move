@@ -961,31 +961,58 @@ async function renameSessionWithAi(ctx, sessionId, configOverride, externalSigna
   const messages = selectTitleMessages(allMessages, config.maxInputBytes)
 
   // 3. Generate the title through our own prompt (fixes typos, concise).
-  //    The route comes from the session's own last request header (its
-  //    current model), falling back to a plugin-configured provider/model
-  //    pair when the session has never issued a request.
+  //    Route CHAIN: a pinned renameAi.provider/model (plugin row config)
+  //    is tried FIRST — titles are a tiny, low-stakes job, so one cheap,
+  //    always-healthy route beats per-session fidelity, and stale sessions
+  //    sitting on dead provider routes never touch their broken route.
+  //    The session's own last request route follows as the automatic
+  //    failover (and is the only route when nothing is pinned). A failing
+  //    attempt (error or timeout) falls through to the next route; a user
+  //    cancellation never does.
   const headerConfig = typeof session.requestHeader === 'function'
     ? session.requestHeader()?.config
     : undefined
-  const route = (headerConfig && headerConfig.provider && headerConfig.model)
-    ? { provider: headerConfig.provider, model: headerConfig.model }
-    : (config.provider && config.model)
+  const candidates = [
+    (config.provider && config.model)
       ? { provider: config.provider, model: config.model }
-      : undefined
-  if (route === undefined) {
+      : undefined,
+    (headerConfig && headerConfig.provider && headerConfig.model)
+      ? { provider: headerConfig.provider, model: headerConfig.model }
+      : undefined,
+  ].filter(Boolean)
+  const routeChain = candidates.filter((route, index) =>
+    !candidates.slice(0, index).some((x) => x.provider === route.provider && x.model === route.model))
+  if (routeChain.length === 0) {
     throw new MoveError(
       'cannot AI-rename: no model route available (session has no request history and the plugin has no provider/model config). Add provider+model to the session-move plugin row config.',
       400,
     )
   }
-  const request = {
-    session,
-    messages,
-    signal: externalSignal,
-    route,
-  }
   if (externalSignal) externalSignal.throwIfAborted()
-  const title = await generateTitleWithCustomPrompt(ctx, validated, request, messages)
+  let title
+  let lastError
+  for (const route of routeChain) {
+    try {
+      title = await generateTitleWithCustomPrompt(ctx, validated, {
+        session,
+        messages,
+        signal: externalSignal,
+        route,
+      }, messages)
+      break
+    } catch (e) {
+      // A user cancellation is not a route failure — stop immediately.
+      if (e instanceof MoveError && e.status === 499) throw e
+      lastError = e
+      ctx.logger?.warn?.(
+        `[dsh-session-move] title route ${route.provider}/${route.model} failed: ${e?.message ?? e}` +
+        (routeChain.indexOf(route) < routeChain.length - 1 ? ' — trying the next route' : ''),
+      )
+    }
+  }
+  if (title === undefined) {
+    throw lastError ?? new MoveError('title generation failed: no route produced a title', 500)
+  }
   // 4. Apply through the sessionTitle service.
   const titleService = ctx.get('sessionTitle')
   if (titleService === undefined || typeof titleService.rename !== 'function') {

@@ -62,7 +62,7 @@ Deletion is complete and permanent: running agents are stopped first, then the l
 
 Open a session's `...` menu → **AI Rename** — the LLM reads a representative sample across the whole conversation (evenly sampled to fit the token budget), fixes any typos, and writes a concise title in the conversation's language. Generation is bounded by `timeoutMs` (default 60s) and can be cancelled at any time while running; the dialog button switches between Cancel (working) and Done (finished).
 
-By default it uses the session's own model route. To pin a different provider/model, configure the plugin row:
+Route chain: if the plugin row pins `renameAi.provider` + `renameAi.model`, that route is tried first and each session's own last request route serves as the automatic failover (and is the only route when nothing is pinned). A failing attempt (error or timeout) falls through to the next route. To pin one, configure the plugin row:
 
 ```yaml
 - id: session-move
