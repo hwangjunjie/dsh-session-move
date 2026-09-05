@@ -29,6 +29,7 @@
 //   POST /__sessionmove/move             - move (body: {sessionId, workspaceId})
 //   POST /__sessionmove/delete           - delete (body: {sessionId})
 //   POST /__sessionmove/rename-ai        - AI rename (body: {sessionId})
+//   POST /__sessionmove/rename-ai-cancel - cancel an in-flight AI rename (body: {sessionId})
 //   workbench_session_move               - model tool wrapper over move
 //   workbench_session_delete             - model tool wrapper over delete
 //   workbench_session_rename_ai          - model tool wrapper over AI rename
@@ -57,7 +58,10 @@ const zstdDecompressAsync = promisify(zstdDecompress)
 const CHECKSUM_OPTIONS = { params: { [constants.ZSTD_c_checksumFlag]: 1 } }
 const ZSTD_MAGIC = 0xfd2fb528
 
-const SESSION_ID_RE = /^(session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+// Accept the three id spellings that exist on disk: bare uuid (native
+// sessions), `session-<uuid>` (platform alias), and `import-<uuid>`
+// (sessions minted by the dsh-chat-import plugin).
+const SESSION_ID_RE = /^(import-)?(session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 class MoveError extends Error {
   constructor(message, status = 400) {
@@ -102,10 +106,17 @@ function projectKey(cwd) {
   return `--${slug.slice(0, 251)}--`
 }
 
-// Session ids appear in two spellings in different stores (raw uuid and
-// `session-<uuid>`); try both when scanning for on-disk directories.
+// Session ids appear in up to three spellings in different stores (raw uuid,
+// `session-<uuid>`, and `import-<uuid>` for chat-import sessions); try the
+// applicable ones when scanning for on-disk directories.
 function sessionIdVariants(sessionId) {
   const variants = new Set([sessionId])
+  if (sessionId.startsWith('import-')) {
+    // Imported sessions are stored under the literal `import-<uuid>` directory
+    // name. Do NOT add the bare-uuid variant: a native session could
+    // theoretically share that uuid, and deleting it must never touch that one.
+    return [...variants]
+  }
   if (sessionId.startsWith('session-')) {
     variants.add(sessionId.slice('session-'.length))
   } else if (SESSION_ID_RE.test(sessionId)) {
@@ -789,6 +800,11 @@ const AI_RENAME_DEFAULTS = {
   timeoutMs: 60000,
 }
 
+// In-flight AI renames keyed by trimmed sessionId -> AbortController, so the
+// web UI cancel button can stop a running rename (stream abort + no title
+// applied). Guarded against concurrent renames of the same session.
+const inflightRenames = new Map()
+
 // Collect human text-bearing user messages in log order (same eligibility
 // rule as the official session-title fold: user-sourced, text-bearing).
 function collectSessionTitleMessages(events, throughSeq) {
@@ -858,10 +874,13 @@ function selectTitleMessages(messages, maxInputBytes) {
 // service. Both generation and rename append to the session, so it must be
 // LIVE: live sessions are used directly, cold sessions are resumed through
 // the agents service (which materializes them in the store) first.
-async function renameSessionWithAi(ctx, sessionId, configOverride) {
+async function renameSessionWithAi(ctx, sessionId, configOverride, externalSignal) {
   if (!SESSION_ID_RE.test(sessionId)) {
     throw new MoveError(`invalid session id: ${sessionId}`, 400)
   }
+  // Honour a user cancellation handed in by the HTTP layer (AbortController
+  // from inflightRenames). throwIfAborted re-throws the stored MoveError.
+  if (externalSignal) externalSignal.throwIfAborted()
   const config = {
     ...AI_RENAME_DEFAULTS,
     ...(configOverride && typeof configOverride === 'object' ? configOverride : {}),
@@ -881,10 +900,46 @@ async function renameSessionWithAi(ctx, sessionId, configOverride) {
   if (session === undefined) {
     const agents = ctx.get('agents')
     if (agents !== undefined && typeof agents.resume === 'function') {
+      // Bounded resume: the agents factory's waitForDrainingConfiguredIdentity
+      // waits (event-driven, NO timeout) for a same-id agent AND session to
+      // leave their registries before rebuilding. A target whose agent is
+      // still registered/stuck (open tab, half-detached state) would hang
+      // the rename forever — race a deadline instead. If the background
+      // resume completes later, the session materializes and the NEXT
+      // attempt takes the fast path.
+      const resumeMs = 30000
+      let resumeTimer
       try {
-        await agents.resume({ resumeSessionId: sessionId })
+        const resumeTimeout = new Promise((_, reject) => {
+          resumeTimer = setTimeout(() => reject(new MoveError(
+            `session resume timed out after ${resumeMs} ms — the session's agent may still be registered (try closing that session's tab, then retry)`,
+            504,
+          )), resumeMs)
+        })
+        resumeTimeout.catch(() => {}) // never leak an unhandled rejection past the race
+        const racers = [agents.resume({ resumeSessionId: sessionId }), resumeTimeout]
+        if (externalSignal) {
+          // User cancellation also stops WAITING for the resume. The
+          // background resume itself cannot be killed, but if it completes
+          // later the session materializes and the next attempt is fast.
+          const cancelPromise = new Promise((_, reject) => {
+            if (externalSignal.aborted) {
+              reject(externalSignal.reason ?? new MoveError('rename cancelled', 499))
+              return
+            }
+            externalSignal.addEventListener('abort', () => {
+              reject(externalSignal.reason ?? new MoveError('rename cancelled', 499))
+            }, { once: true })
+          })
+          cancelPromise.catch(() => {})
+          racers.push(cancelPromise)
+        }
+        await Promise.race(racers)
       } catch (e) {
         ctx.logger?.warn?.('[dsh-session-move] cold-session resume failed:', e?.message ?? e)
+        if (e instanceof MoveError) throw e
+      } finally {
+        clearTimeout(resumeTimer)
       }
       session = ctx.sessions?.get?.(sessionId)
     }
@@ -894,7 +949,12 @@ async function renameSessionWithAi(ctx, sessionId, configOverride) {
   // 2. Collect human user messages from the live log. Long conversations are
   //    sampled evenly across the timeline so the title model sees the arc of
   //    the conversation while the input stays under maxInputBytes.
-  const events = [...session.events]
+  //    NOTE: cold-resumed sessions expose no iterable `events` property —
+  //    the supported accessor is snapshotEvents() (the same source the
+  //    official session-title service reads). Fall back defensively.
+  const events = typeof session.snapshotEvents === 'function'
+    ? session.snapshotEvents()
+    : [...(session.events ?? [])]
   if (events.length === 0) throw new MoveError(`session has no message history: ${sessionId}`, 400)
   const allMessages = collectSessionTitleMessages(events)
   if (allMessages.length === 0) throw new MoveError(`session has no user messages to summarize: ${sessionId}`, 400)
@@ -921,15 +981,17 @@ async function renameSessionWithAi(ctx, sessionId, configOverride) {
   const request = {
     session,
     messages,
-    signal: new AbortController().signal,
+    signal: externalSignal,
     route,
   }
+  if (externalSignal) externalSignal.throwIfAborted()
   const title = await generateTitleWithCustomPrompt(ctx, validated, request, messages)
   // 4. Apply through the sessionTitle service.
   const titleService = ctx.get('sessionTitle')
   if (titleService === undefined || typeof titleService.rename !== 'function') {
     throw new MoveError('session title service is not available', 500)
   }
+  if (externalSignal) externalSignal.throwIfAborted()
   const accepted = titleService.rename(session, title)
   return {
     title: accepted.title,
@@ -956,6 +1018,7 @@ const TITLE_SYSTEM_PROMPT = [
 
 async function generateTitleWithCustomPrompt(ctx, config, request, selectedMessages) {
   if (selectedMessages.length === 0) throw new MoveError('at least one source message is required', 400)
+  if (request.signal) request.signal.throwIfAborted()
   const system = TITLE_SYSTEM_PROMPT
     .replace('{cjk}', String(config.targetCjkCharacters))
     .replace('{words}', String(config.targetWords))
@@ -964,6 +1027,23 @@ async function generateTitleWithCustomPrompt(ctx, config, request, selectedMessa
     content: [{ type: 'text', text: userText }],
     source: { kind: 'plugin', plugin: 'dsh-session-move' },
   })]
+  // Enforce config.timeoutMs — the official session-title-llm wraps its LLM
+  // call in a deadline signal; without one, a stalled provider route hangs
+  // the stream (and the HTTP response / agent tool) forever.
+  const timeoutMs = Number(config.timeoutMs) > 0 ? Number(config.timeoutMs) : 60000
+  const deadline = new AbortController()
+  const timer = setTimeout(() => {
+    deadline.abort(new MoveError(`AI rename timed out after ${timeoutMs} ms waiting for the title model`, 504))
+  }, timeoutMs)
+  // Forward an external user cancellation onto the deadline so the stream
+  // aborts immediately (same plumbing as the timeout).
+  const forwardCancel = request.signal
+    ? () => deadline.abort(request.signal.reason ?? new MoveError('rename cancelled', 499))
+    : null
+  if (forwardCancel) {
+    if (request.signal.aborted) forwardCancel()
+    else request.signal.addEventListener('abort', forwardCancel, { once: true })
+  }
   const options = {
     provider: request.route.provider,
     model: request.route.model,
@@ -972,16 +1052,28 @@ async function generateTitleWithCustomPrompt(ctx, config, request, selectedMessa
     maxTokens: config.maxOutputTokens,
     sessionId: request.session.id,
     purpose: 'session-title',
-    signal: request.signal,
+    signal: deadline.signal,
   }
   const assembler = new BlockAssembler()
-  for await (const chunk of ctx.llm.stream(options)) {
-    request.signal.throwIfAborted()
-    assembler.push(chunk)
+  try {
+    for await (const chunk of ctx.llm.stream(options)) {
+      deadline.signal.throwIfAborted()
+      assembler.push(chunk)
+    }
+  } finally {
+    clearTimeout(timer)
+    if (forwardCancel && request.signal) {
+      request.signal.removeEventListener('abort', forwardCancel)
+    }
   }
   const finish = assembler.finish
-  if (finish !== undefined && finish.kind !== 'stop' && finish.kind !== 'length') {
-    throw new MoveError(`title generation failed: unexpected finish ${JSON.stringify(finish)}`, 500)
+  if (finish !== undefined) {
+    if (finish.kind === 'error' || finish.kind === 'aborted') {
+      throw new MoveError(`title generation failed: ${finish.failure?.message ?? finish.kind}`, 500)
+    }
+    if (finish.kind !== 'stop' && finish.kind !== 'max-tokens' && finish.kind !== 'length') {
+      throw new MoveError(`title generation failed: unexpected finish ${JSON.stringify(finish)}`, 500)
+    }
   }
   const blocks = assembler.blocks()
   const text = blocks
@@ -1153,13 +1245,51 @@ function apply(ctx, config) {
           sendJson(res, 400, { error: 'sessionId required' })
           return
         }
+        if (inflightRenames.has(sessionId)) {
+          sendJson(res, 409, { error: 'an AI rename for this session is already in progress' })
+          return
+        }
+        const controller = new AbortController()
+        inflightRenames.set(sessionId, controller)
         try {
-          const result = await renameSessionWithAi(ctx, sessionId, pluginConfig)
+          const result = await renameSessionWithAi(ctx, sessionId, pluginConfig, controller.signal)
           sendJson(res, 200, { ok: true, ...result })
         } catch (e) {
           const status = e instanceof MoveError ? e.status : 500
           sendJson(res, status, { error: e.message })
+        } finally {
+          inflightRenames.delete(sessionId)
         }
+      },
+    }))
+    targetCtx.effect(() => host.register({
+      kind: 'exact',
+      path: '/__sessionmove/rename-ai-cancel',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { error: 'method not allowed' })
+          return
+        }
+        let args = {}
+        try {
+          const body = await readBody(req)
+          if (body) args = JSON.parse(body)
+        } catch {
+          sendJson(res, 400, { error: 'bad json body' })
+          return
+        }
+        const sessionId = String(args.sessionId || '').trim()
+        if (!sessionId) {
+          sendJson(res, 400, { error: 'sessionId required' })
+          return
+        }
+        const controller = inflightRenames.get(sessionId)
+        if (!controller) {
+          sendJson(res, 200, { ok: false, error: 'no in-flight AI rename for this session' })
+          return
+        }
+        controller.abort(new MoveError('rename cancelled', 499))
+        sendJson(res, 200, { ok: true, cancelled: true })
       },
     }))
   }

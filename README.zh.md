@@ -60,7 +60,7 @@ sudo systemctl restart dsh
 
 ### ✨ AI 重命名
 
-打开会话的 `...` 菜单 → **AI 重命名** — LLM 阅读整个对话的**均匀采样**（控制 token 预算内覆盖全时间线），自动纠正错别字，用对话本身的语言生成简洁标题。
+打开会话的 `...` 菜单 → **AI 重命名** — LLM 阅读整个对话的**均匀采样**（控制 token 预算内覆盖全时间线），自动纠正错别字，用对话本身的语言生成简洁标题。生成受 `timeoutMs` 约束（默认 60 秒），进行中可随时取消；弹窗按钮在「取消」（生成中，可点击）与「完成」（成功后）之间切换。
 
 默认使用会话自身的模型路由。要固定别的 provider/model，配置插件行：
 
@@ -100,6 +100,7 @@ sudo systemctl restart dsh
 | `/__sessionmove/move` | POST | `{ sessionId, workspaceId }` | 移动结果（旧/新 cwd、workspace id、agentReleased） |
 | `/__sessionmove/delete` | POST | `{ sessionId }` | 删除了什么 |
 | `/__sessionmove/rename-ai` | POST | `{ sessionId }` | 新标题 |
+| `/__sessionmove/rename-ai-cancel` | POST | `{ sessionId }` | `{ ok, cancelled }` — 中止进行中的 AI 重命名（不落盘标题） |
 
 ---
 
