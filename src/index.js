@@ -34,6 +34,14 @@
 //   workbench_session_rename_ai          - model tool wrapper over AI rename
 //
 // ESM module format (cordis bundle rule): named exports apply/inject/name.
+//
+// Session log generations: this module originally hardcoded the generation-0
+// filename `session.jsonl.zstd`. Stores that moved to generation 3 keep a
+// stale stub with that name next to `session.v3.jsonl.zstd`, so a move read
+// the stub — the directory was relocated, but the authoritative log kept its
+// old cwd and every later load failed with "header id ... and cwd identify
+// ...". Read and rewrite the NEWEST canonical generation instead
+// (parseGenerationLogName / newestLogFile below).
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -198,26 +206,64 @@ function scanZstdFrames(buffer) {
   return frames
 }
 
-// Read the session header line: decompress the first frame, parse its JSON.
-async function readSessionHeader(sessionDirPath) {
-  const file = path.join(sessionDirPath, 'session.jsonl.zstd')
-  if (!fs.existsSync(file)) {
-    // Plaintext fallback (compression: none) — just in case.
-    const plain = path.join(sessionDirPath, 'session.jsonl')
-    if (fs.existsSync(plain)) {
-      const first = fs.readFileSync(plain, 'utf8').split('\n')[0]
-      return JSON.parse(first)
-    }
-    throw new MoveError(`session log not found in ${sessionDirPath}`, 500)
+// Canonical generation basenames (dsh-session-format): session.jsonl[.zstd]
+// is generation 0, session.vN.jsonl[.zstd] is generation N.
+function parseGenerationLogName(name) {
+  const match = /^session(?:\.v(\d+))?\.jsonl(\.zstd)?$/.exec(name)
+  if (!match) return undefined
+  return {
+    version: match[1] === undefined ? 0 : Number(match[1]),
+    zstd: match[2] !== undefined,
   }
-  const bytes = fs.readFileSync(file)
+}
+
+// Newest canonical generation inside one session directory — the file the
+// storage backend itself selects (highest version wins).
+function newestLogFile(sessionDirPath) {
+  let entries = []
+  try {
+    entries = fs.readdirSync(sessionDirPath, { withFileTypes: true })
+  } catch {
+    return undefined
+  }
+  let best
+  for (const entry of entries) {
+    if (!entry.isFile()) continue
+    const generation = parseGenerationLogName(entry.name)
+    if (!generation) continue
+    if (!best || generation.version > best.version) {
+      best = { ...generation, name: entry.name, file: path.join(sessionDirPath, entry.name) }
+    }
+  }
+  return best
+}
+
+// Read the session header line of the newest generation: decompress its first
+// frame, parse its JSON. `logName` is returned so the caller rewrites the
+// same generation file it read.
+async function readSessionHeader(sessionDirPath) {
+  const generation = newestLogFile(sessionDirPath)
+  if (!generation) throw new MoveError(`session log not found in ${sessionDirPath}`, 500)
+  if (!generation.zstd) {
+    // Plaintext generation (compression: none).
+    const first = fs.readFileSync(generation.file, 'utf8').split('\n')[0]
+    return { header: JSON.parse(first), frameBytes: null, frameIndex: [], logName: generation.name }
+  }
+  const bytes = fs.readFileSync(generation.file)
   const frames = scanZstdFrames(bytes)
-  if (frames.length === 0) throw new MoveError(`cannot locate header frame of ${file}`, 500)
+  if (frames.length === 0) {
+    throw new MoveError(`cannot locate header frame of ${generation.file}`, 500)
+  }
   const first = bytes.subarray(frames[0].start, frames[0].end)
   const plaintext = await zstdDecompressAsync(first)
   const text = plaintext.toString('utf8')
   const line = text.split('\n')[0]
-  return { header: JSON.parse(line), frameBytes: first, frameIndex: frames }
+  return {
+    header: JSON.parse(line),
+    frameBytes: first,
+    frameIndex: frames,
+    logName: generation.name,
+  }
 }
 
 // Patch the header line's cwd and rewrite the artifact: new first frame
@@ -227,11 +273,20 @@ async function readSessionHeader(sessionDirPath) {
 // original writer.
 async function rewriteHeaderCwd(file, header, firstFrameBytes, frames, newCwd) {
   const patched = { ...header, cwd: newCwd }
+  const tmp = `${file}.move-tmp-${process.pid}`
+  if (firstFrameBytes === null) {
+    // Plaintext generation: replace the first line, keep the rest verbatim.
+    const text = fs.readFileSync(file, 'utf8')
+    const newline = text.indexOf('\n')
+    const out = `${JSON.stringify(patched)}\n` + (newline === -1 ? '' : text.slice(newline + 1))
+    fs.writeFileSync(tmp, out)
+    fs.renameSync(tmp, file)
+    return
+  }
   const newFirst = await zstdCompressAsync(`${JSON.stringify(patched)}\n`, CHECKSUM_OPTIONS)
   const bytes = fs.readFileSync(file)
   const trailing = frames.slice(1).map((f) => bytes.subarray(f.start, f.end))
   const out = Buffer.concat([newFirst, ...trailing])
-  const tmp = `${file}.move-tmp-${process.pid}`
   fs.writeFileSync(tmp, out)
   fs.renameSync(tmp, file)
 }
@@ -449,7 +504,7 @@ async function moveSessionCore(ctx, sessionId, workspaceId) {
   const dirs = findSessionDirs(sessionId)
   if (dirs.length === 0) throw new MoveError(`session not found: ${sessionId}`, 404)
   const sessionDirPath = dirs[0]
-  const { header, frameBytes, frameIndex } = await readSessionHeader(sessionDirPath)
+  const { header, frameBytes, frameIndex, logName } = await readSessionHeader(sessionDirPath)
   const oldCwd = header.cwd
 
   // 3. When the session already lives in the target directory, the physical
@@ -554,8 +609,9 @@ async function moveSessionCore(ctx, sessionId, workspaceId) {
     throw new MoveError(`failed to move session directory: ${error.message}`, 500)
   }
 
-  // 5. Rewrite the header cwd in the new location.
-  const logFile = path.join(newSessionDir, 'session.jsonl.zstd')
+  // 5. Rewrite the header cwd in the new location — the same generation file
+  //    we read (the newest canonical one, never the stale generation-0 stub).
+  const logFile = path.join(newSessionDir, logName)
   try {
     await rewriteHeaderCwd(logFile, header, frameBytes, frameIndex, target.path)
   } catch (error) {
