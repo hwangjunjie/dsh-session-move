@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
   id: 'dsh-session-move',
   factory: (require) => {
     const React = require('react')
-    const { useCallback, useEffect, useState } = React
+    const { useCallback, useEffect, useRef, useState } = React
     const { Modal } = require('@deepseek-ai/dsh-client-ui-primitives')
 
     const ROW_MENU_ATTR = 'data-session-move'
@@ -41,6 +41,7 @@ window.__ModuleLoader__.load({
       'menu.aiRename': 'AI 重命名',
       'dialog.title': '移动会话到文件夹',
       'dialog.cancel': '取消',
+      'dialog.done': '完成',
       'dialog.confirm': '移动',
       'dialog.moving': '移动中…',
       'dialog.untitled': '未命名会话',
@@ -78,6 +79,7 @@ window.__ModuleLoader__.load({
       'menu.aiRename': 'AI Rename',
       'dialog.title': 'Move session to folder',
       'dialog.cancel': 'Cancel',
+      'dialog.done': 'Done',
       'dialog.confirm': 'Move',
       'dialog.moving': 'Moving…',
       'dialog.untitled': 'Untitled session',
@@ -664,24 +666,48 @@ window.__ModuleLoader__.load({
         return () => window.removeEventListener(AI_RENAME_EVENT, handler)
       }, [])
 
+      // AbortController for the in-flight rename request. Cancel (or closing
+      // the dialog) aborts the fetch AND asks the host to stop the rename.
+      const abortRef = useRef(null)
+
       const close = useCallback(() => {
-        if (busy) return
+        const controller = abortRef.current
+        abortRef.current = null
+        if (controller) {
+          try { controller.abort() } catch { /* already aborted */ }
+          // Best-effort: tell the host to stop the in-flight rename for this
+          // session. Harmless no-op when nothing is in flight.
+          if (target && target.sessionId) {
+            try {
+              fetch('/__sessionmove/rename-ai-cancel', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ sessionId: target.sessionId }),
+              }).catch(() => { /* fire-and-forget */ })
+            } catch { /* fire-and-forget */ }
+          }
+        }
+        setBusy(false)
         setTarget(null)
         setError(null)
         setDoneTitle(null)
-      }, [busy])
+      }, [target])
 
       // Start renaming immediately when the dialog opens with a real session.
       useEffect(() => {
         if (!target || target.notFound || !target.sessionId || busy || doneTitle !== null) return
         setBusy(true)
         setError(null)
+        const controller = new AbortController()
+        abortRef.current = controller
         fetch('/__sessionmove/rename-ai', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ sessionId: target.sessionId }),
+          signal: controller.signal,
         })
           .then(async (res) => {
+            if (abortRef.current !== controller) return // dialog closed mid-flight
             let data = {}
             try { data = await res.json() } catch { /* keep {} */ }
             if (!res.ok || !data.ok) {
@@ -692,6 +718,7 @@ window.__ModuleLoader__.load({
             refreshSessions(__sessionsSvc)
           })
           .catch((reason) => {
+            if (abortRef.current !== controller) return // cancelled/closed: stay quiet
             setBusy(false)
             setError(reason && reason.message ? reason.message : String(reason))
           })
@@ -750,16 +777,17 @@ window.__ModuleLoader__.load({
         open: true,
         onClose: close,
         title: t('aiRename.title'),
-        closeLabel: t('dialog.cancel'),
+        closeLabel: doneTitle !== null ? t('dialog.done') : t('dialog.cancel'),
         description: target.notFound ? t('aiRename.notFoundDesc') : t('aiRename.desc'),
         footer: [
           React.createElement('button', {
             key: 'close',
             type: 'button',
-            disabled: busy,
+            // Always clickable: during busy it cancels the in-flight rename
+            // (abort + host-side cancel); after success it just closes.
             onClick: close,
             style: closeBtnStyle,
-          }, t('dialog.cancel')),
+          }, doneTitle !== null ? t('dialog.done') : t('dialog.cancel')),
         ],
       }, [
         React.createElement('div', { key: 'meta', style: metaStyle },

@@ -60,9 +60,9 @@ Deletion is complete and permanent: running agents are stopped first, then the l
 
 ### ✨ AI rename
 
-Open a session's `...` menu → **AI Rename** — the LLM reads a representative sample across the whole conversation (evenly sampled to fit the token budget), fixes any typos, and writes a concise title in the conversation's language.
+Open a session's `...` menu → **AI Rename** — the LLM reads a representative sample across the whole conversation (evenly sampled to fit the token budget), fixes any typos, and writes a concise title in the conversation's language. Generation is bounded by `timeoutMs` (default 60s) and can be cancelled at any time while running; the dialog button switches between Cancel (working) and Done (finished).
 
-By default it uses the session's own model route. To pin a different provider/model, configure the plugin row:
+Route chain: if the plugin row pins `renameAi.provider` + `renameAi.model`, that route is tried first and each session's own last request route serves as the automatic failover (and is the only route when nothing is pinned). A failing attempt (error or timeout) falls through to the next route. To pin one, configure the plugin row:
 
 ```yaml
 - id: session-move
@@ -100,6 +100,7 @@ These power the UI; they are also usable directly:
 | `/__sessionmove/move` | POST | `{ sessionId, workspaceId }` | move result (old/new cwd, workspace ids, agentReleased) |
 | `/__sessionmove/delete` | POST | `{ sessionId }` | what was removed |
 | `/__sessionmove/rename-ai` | POST | `{ sessionId }` | the new title |
+| `/__sessionmove/rename-ai-cancel` | POST | `{ sessionId }` | `{ ok, cancelled }` — aborts the in-flight AI rename (no title applied) |
 
 ---
 
