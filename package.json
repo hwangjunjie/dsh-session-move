@@ -29,7 +29,8 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.1.0-rc.6"
   },
   "dsh": {
     "bundle": {
